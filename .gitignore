@@ -1,0 +1,10 @@
+/target/
+Cargo.lock
+*.dll
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*~
