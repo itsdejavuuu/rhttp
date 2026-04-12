@@ -1,25 +1,21 @@
 # gmsv_rhttp
 
-> "another http module bc gmod's built-in one is mid"
-
-async http client for gmod using rust (lfg)
-
-## why?
-
-- built-in http blocks the game tick
-- no connection pooling
-- this one uses tokio + reqwest
+async HTTP module for Garry’s Mod written in rust
 
 ## features
 
-- async requests that don't freeze the server
+- fully asynchronous HTTP requests (non-blocking)
 - connection pooling
-- 256 concurrent request cap
-- 20MB body limit
-- rustls - no openssl nonsense
+- configurable concurrency limit (default: 256)
+- request body size limit: 20 MB
+- TLS via `rustls` (no OpenSSL dependency)
 
 ## build
 
+requires nightly rusttoolchain
+
+```bash
+cargo +nightly build --release
 ```bash
 cargo build --release
 ```
@@ -49,4 +45,3 @@ rhttp({
 ## notes
 
 - requires nightly rust
-- tested on windows
