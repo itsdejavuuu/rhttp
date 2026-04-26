@@ -1,4 +1,4 @@
-# gmsv_rhttp
+# gmsv_rhttp 
 
 async HTTP module for Garry’s Mod written in rust
 
@@ -16,8 +16,6 @@ requires nightly rusttoolchain
 
 ```bash
 cargo +nightly build --release
-```bash
-cargo build --release
 ```
 
 drop target/release/gmsv_rhttp.dll into garrysmod/lua/bin/
