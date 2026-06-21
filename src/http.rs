@@ -1,4 +1,7 @@
-use crate::worker::{resources, spawn_task, CallbackTask, MAX_IN_FLIGHT_REQUESTS};
+use crate::worker::{
+    resources, spawn_task, BodyBudget, CallbackTask, RequestCallbacks, MAX_IN_FLIGHT_REQUESTS,
+};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use gmod::lua::State;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -40,14 +43,16 @@ fn retry_delay(headers: Option<&HeaderMap>, attempt: usize, base: Duration) -> D
 
 async fn report_failure(
     tx: &tokio::sync::mpsc::Sender<CallbackTask>,
-    success_cb: Option<gmod::lua::LuaReference>,
-    failed_cb: Option<gmod::lua::LuaReference>,
+    callbacks: Option<RequestCallbacks>,
     message: String,
 ) {
-    if let Some(cb) = failed_cb {
+    let Some(callbacks) = callbacks else {
+        return;
+    };
+    if let Some(cb) = callbacks.failed {
         let _ = tx.send(CallbackTask::Failed(cb, message)).await;
     }
-    if let Some(cb) = success_cb {
+    if let Some(cb) = callbacks.success {
         let _ = tx.send(CallbackTask::DropRef(cb)).await;
     }
 }
@@ -215,7 +220,7 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
     lua.pop_n(1);
 
     lua.get_field(1, lua_string!("body"));
-    let mut body = lua.get_binary_string(-1).map(|b| b.to_vec());
+    let mut body = lua.get_binary_string(-1).map(Bytes::copy_from_slice);
     lua.pop_n(1);
 
     lua.get_field(1, lua_string!("type"));
@@ -231,7 +236,7 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
         if method == reqwest::Method::POST {
             if body.is_none() {
                 body = match serde_urlencoded::to_string(parameters) {
-                    Ok(body) => Some(body.into_bytes()),
+                    Ok(body) => Some(Bytes::from(body.into_bytes())),
                     Err(e) => {
                         fail_request(
                             lua,
@@ -315,6 +320,25 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
         fail_request(lua, success_cb, failed_cb, "rhttp is not initialized");
         return 1;
     };
+    let request_body_budget = match body.as_ref() {
+        Some(body) if !body.is_empty() => match worker
+            .body_budget
+            .clone()
+            .try_acquire_many_owned(body.len() as u32)
+        {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                fail_request(
+                    lua,
+                    success_cb,
+                    failed_cb,
+                    "rhttp buffered body limit reached",
+                );
+                return 1;
+            }
+        },
+        _ => None,
+    };
     let Some(in_flight) = worker.stats.try_request_started() else {
         fail_request(
             lua,
@@ -327,13 +351,15 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
         );
         return 1;
     };
-    let registered_request = worker.requests.register();
+    let collect_body = success_cb.is_some();
+    let registered_request = worker.requests.register(success_cb, failed_cb);
     let request_id = registered_request.id;
 
     let handle = worker.handle();
     spawn_task(handle, async move {
         let _registered_request = registered_request;
         let _in_flight = in_flight;
+        let _request_body_budget = request_body_budget;
         let token = _registered_request.token.clone();
         let tx = worker.callback_tx;
         let mut attempt = 0;
@@ -341,14 +367,24 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
         loop {
             if token.is_cancelled() {
                 worker.stats.cancelled();
-                report_failure(&tx, success_cb, failed_cb, "Request cancelled".to_string()).await;
+                report_failure(
+                    &tx,
+                    _registered_request.take_callbacks(),
+                    "Request cancelled".to_string(),
+                )
+                .await;
                 return;
             }
 
             let permit = tokio::select! {
                 _ = token.cancelled() => {
                     worker.stats.cancelled();
-                    report_failure(&tx, success_cb, failed_cb, "Request cancelled".to_string()).await;
+                    report_failure(
+                        &tx,
+                        _registered_request.take_callbacks(),
+                        "Request cancelled".to_string(),
+                    )
+                    .await;
                     return;
                 }
                 permit = worker.concurrency_limit.clone().acquire_owned() => permit.ok(),
@@ -367,7 +403,12 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
                 _ = token.cancelled() => {
                     drop(permit);
                     worker.stats.cancelled();
-                    report_failure(&tx, success_cb, failed_cb, "Request cancelled".to_string()).await;
+                    report_failure(
+                        &tx,
+                        _registered_request.take_callbacks(),
+                        "Request cancelled".to_string(),
+                    )
+                    .await;
                     return;
                 }
                 response = request.send() => response,
@@ -384,7 +425,12 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
                         tokio::select! {
                             _ = token.cancelled() => {
                                 worker.stats.cancelled();
-                                report_failure(&tx, success_cb, failed_cb, "Request cancelled".to_string()).await;
+                                report_failure(
+                                    &tx,
+                                    _registered_request.take_callbacks(),
+                                    "Request cancelled".to_string(),
+                                )
+                                .await;
                                 return;
                             }
                             _ = tokio::time::sleep(delay) => continue,
@@ -393,7 +439,8 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
 
                     worker.stats.failed();
                     drop(permit);
-                    report_failure(&tx, success_cb, failed_cb, error.to_string()).await;
+                    report_failure(&tx, _registered_request.take_callbacks(), error.to_string())
+                        .await;
                     return;
                 }
             };
@@ -407,7 +454,12 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
                 tokio::select! {
                     _ = token.cancelled() => {
                         worker.stats.cancelled();
-                        report_failure(&tx, success_cb, failed_cb, "Request cancelled".to_string()).await;
+                        report_failure(
+                            &tx,
+                            _registered_request.take_callbacks(),
+                            "Request cancelled".to_string(),
+                        )
+                        .await;
                         return;
                     }
                     _ = tokio::time::sleep(delay) => continue,
@@ -417,15 +469,20 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
             let status = response.status().as_u16();
             let response_headers = response.headers().clone();
             let mut body_bytes = Vec::new();
+            let mut response_body_budget = BodyBudget::new();
             let mut response_size = 0;
-            let collect_body = success_cb.is_some();
             let mut stream = response.bytes_stream();
 
             while let Some(chunk_result) = tokio::select! {
                 _ = token.cancelled() => {
                     drop(permit);
                     worker.stats.cancelled();
-                    report_failure(&tx, success_cb, failed_cb, "Request cancelled".to_string()).await;
+                    report_failure(
+                        &tx,
+                        _registered_request.take_callbacks(),
+                        "Request cancelled".to_string(),
+                    )
+                    .await;
                     return;
                 }
                 chunk = stream.next() => chunk,
@@ -438,14 +495,32 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
                             drop(permit);
                             report_failure(
                                 &tx,
-                                success_cb,
-                                failed_cb,
+                                _registered_request.take_callbacks(),
                                 "Response body exceeded memory limit".to_string(),
                             )
                             .await;
                             return;
                         }
                         if collect_body {
+                            let permit = match worker
+                                .body_budget
+                                .clone()
+                                .try_acquire_many_owned(chunk.len() as u32)
+                            {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    worker.stats.failed();
+                                    drop(permit);
+                                    report_failure(
+                                        &tx,
+                                        _registered_request.take_callbacks(),
+                                        "rhttp buffered body limit reached".to_string(),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            };
+                            response_body_budget.reserve(permit);
                             body_bytes.extend_from_slice(&chunk);
                         }
                     }
@@ -454,8 +529,7 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
                         drop(permit);
                         report_failure(
                             &tx,
-                            success_cb,
-                            failed_cb,
+                            _registered_request.take_callbacks(),
                             format!("Stream error: {}", error),
                         )
                         .await;
@@ -466,18 +540,21 @@ pub unsafe extern "C-unwind" fn request_lua(lua: State) -> i32 {
 
             worker.stats.succeeded();
             drop(permit);
-            if let Some(cb) = success_cb {
-                let _ = tx
-                    .send(CallbackTask::Success(
-                        cb,
-                        status,
-                        body_bytes.into(),
-                        response_headers,
-                    ))
-                    .await;
-            }
-            if let Some(cb) = failed_cb {
-                let _ = tx.send(CallbackTask::DropRef(cb)).await;
+            if let Some(callbacks) = _registered_request.take_callbacks() {
+                if let Some(cb) = callbacks.success {
+                    let _ = tx
+                        .send(CallbackTask::Success(
+                            cb,
+                            status,
+                            body_bytes.into(),
+                            response_headers,
+                            response_body_budget,
+                        ))
+                        .await;
+                }
+                if let Some(cb) = callbacks.failed {
+                    let _ = tx.send(CallbackTask::DropRef(cb)).await;
+                }
             }
             return;
         }

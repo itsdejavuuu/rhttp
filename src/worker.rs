@@ -5,15 +5,37 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_IN_FLIGHT_REQUESTS: u64 = 1024;
+pub const MAX_BUFFERED_BODY_BYTES: u32 = 64 * 1024 * 1024;
 
 pub enum CallbackTask {
-    Success(LuaReference, u16, Bytes, HeaderMap),
+    Success(LuaReference, u16, Bytes, HeaderMap, BodyBudget),
     Failed(LuaReference, String),
     DropRef(LuaReference),
+}
+
+pub struct BodyBudget {
+    _permits: Vec<OwnedSemaphorePermit>,
+}
+
+impl BodyBudget {
+    pub fn new() -> Self {
+        Self {
+            _permits: Vec::new(),
+        }
+    }
+
+    pub fn reserve(&mut self, permit: OwnedSemaphorePermit) {
+        self._permits.push(permit);
+    }
+}
+
+pub struct RequestCallbacks {
+    pub success: Option<LuaReference>,
+    pub failed: Option<LuaReference>,
 }
 
 pub struct HttpStats {
@@ -109,7 +131,12 @@ impl Drop for InFlightRequest {
 
 pub struct RequestRegistry {
     next_id: AtomicU64,
-    requests: Mutex<HashMap<u64, CancellationToken>>,
+    requests: Mutex<HashMap<u64, RequestEntry>>,
+}
+
+struct RequestEntry {
+    token: CancellationToken,
+    callbacks: Option<RequestCallbacks>,
 }
 
 impl RequestRegistry {
@@ -120,11 +147,21 @@ impl RequestRegistry {
         }
     }
 
-    pub fn register(self: &Arc<Self>) -> RegisteredRequest {
+    pub fn register(
+        self: &Arc<Self>,
+        success: Option<LuaReference>,
+        failed: Option<LuaReference>,
+    ) -> RegisteredRequest {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let token = CancellationToken::new();
         if let Ok(mut requests) = self.requests.lock() {
-            requests.insert(id, token.clone());
+            requests.insert(
+                id,
+                RequestEntry {
+                    token: token.clone(),
+                    callbacks: Some(RequestCallbacks { success, failed }),
+                },
+            );
         }
         RegisteredRequest {
             id,
@@ -144,7 +181,7 @@ impl RequestRegistry {
             .requests
             .lock()
             .ok()
-            .and_then(|requests| requests.get(&id).cloned());
+            .and_then(|requests| requests.get(&id).map(|entry| entry.token.clone()));
         if let Some(token) = token {
             token.cancel();
             true
@@ -153,15 +190,27 @@ impl RequestRegistry {
         }
     }
 
-    fn cancel_all(&self) {
-        let tokens = self
+    pub fn take_callbacks(&self, id: u64) -> Option<RequestCallbacks> {
+        self.requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.get_mut(&id)?.callbacks.take())
+    }
+
+    fn cancel_all(&self) -> Vec<RequestCallbacks> {
+        let entries = self
             .requests
             .lock()
-            .map(|mut requests| requests.drain().map(|(_, token)| token).collect::<Vec<_>>())
+            .map(|mut requests| requests.drain().map(|(_, entry)| entry).collect::<Vec<_>>())
             .unwrap_or_default();
-        for token in tokens {
-            token.cancel();
+        let mut callbacks = Vec::with_capacity(entries.len());
+        for mut entry in entries {
+            entry.token.cancel();
+            if let Some(callbacks_for_request) = entry.callbacks.take() {
+                callbacks.push(callbacks_for_request);
+            }
         }
+        callbacks
     }
 }
 
@@ -177,12 +226,19 @@ impl Drop for RegisteredRequest {
     }
 }
 
+impl RegisteredRequest {
+    pub fn take_callbacks(&self) -> Option<RequestCallbacks> {
+        self.registry.take_callbacks(self.id)
+    }
+}
+
 struct WorkerState {
     callback_tx: Option<tokio::sync::mpsc::Sender<CallbackTask>>,
     callback_rx: Option<tokio::sync::mpsc::Receiver<CallbackTask>>,
     runtime: Option<tokio::runtime::Runtime>,
     client: Option<reqwest::Client>,
     concurrency_limit: Option<Arc<Semaphore>>,
+    body_budget: Option<Arc<Semaphore>>,
     stats: Option<Arc<HttpStats>>,
     requests: Option<Arc<RequestRegistry>>,
 }
@@ -195,6 +251,7 @@ impl WorkerState {
             runtime: None,
             client: None,
             concurrency_limit: None,
+            body_budget: None,
             stats: None,
             requests: None,
         }
@@ -207,6 +264,7 @@ pub struct WorkerResources {
     pub callback_tx: tokio::sync::mpsc::Sender<CallbackTask>,
     pub client: reqwest::Client,
     pub concurrency_limit: Arc<Semaphore>,
+    pub body_budget: Arc<Semaphore>,
     pub stats: Arc<HttpStats>,
     pub requests: Arc<RequestRegistry>,
     handle: tokio::runtime::Handle,
@@ -243,6 +301,7 @@ pub fn init(lua: State) {
         state.callback_rx = Some(callback_rx);
         state.client = Some(client);
         state.concurrency_limit = Some(Arc::new(Semaphore::new(256)));
+        state.body_budget = Some(Arc::new(Semaphore::new(MAX_BUFFERED_BODY_BYTES as usize)));
         state.stats = Some(Arc::new(HttpStats::new()));
         state.requests = Some(Arc::new(RequestRegistry::new()));
         state.runtime = Some(runtime);
@@ -268,6 +327,7 @@ pub fn resources() -> Option<WorkerResources> {
         callback_tx: state.callback_tx.clone()?,
         client: state.client.clone()?,
         concurrency_limit: state.concurrency_limit.clone()?,
+        body_budget: state.body_budget.clone()?,
         stats: state.stats.clone()?,
         requests: state.requests.clone()?,
         handle: state.runtime.as_ref()?.handle().clone(),
@@ -315,7 +375,7 @@ unsafe extern "C-unwind" fn think(lua: State) -> i32 {
         };
 
         match task {
-            CallbackTask::Success(cb, status, body, headers) => {
+            CallbackTask::Success(cb, status, body, headers, _body_budget) => {
                 lua.from_reference(cb);
                 lua.push_integer(status as _);
                 lua.push_binary_string(&body);
@@ -356,28 +416,60 @@ pub fn shutdown(lua: State) {
         lua.pop();
     }
 
-    let runtime = WORKER.get().and_then(|worker| {
+    let Some((runtime, callback_rx, callbacks)) = WORKER.get().and_then(|worker| {
         let mut state = worker.lock().ok()?;
-        if let Some(requests) = state.requests.take() {
-            requests.cancel_all();
-        }
+        let callbacks = state
+            .requests
+            .take()
+            .map(|requests| requests.cancel_all())
+            .unwrap_or_default();
         state.callback_tx = None;
-        state.callback_rx = None;
+        let callback_rx = state.callback_rx.take();
         state.client = None;
         state.concurrency_limit = None;
+        state.body_budget = None;
         state.stats = None;
-        state.runtime.take()
-    });
+        Some((state.runtime.take(), callback_rx, callbacks))
+    }) else {
+        return;
+    };
 
     if let Some(rt) = runtime {
         rt.shutdown_timeout(Duration::from_millis(250));
+    }
+
+    if let Some(mut rx) = callback_rx {
+        while let Ok(task) = rx.try_recv() {
+            unsafe { discard_callback_task(lua, task) };
+        }
+    }
+    for callbacks_for_request in callbacks {
+        unsafe { discard_callbacks(lua, callbacks_for_request) };
+    }
+}
+
+unsafe fn discard_callback_task(lua: State, task: CallbackTask) {
+    match task {
+        CallbackTask::Success(cb, _, _, _, _)
+        | CallbackTask::Failed(cb, _)
+        | CallbackTask::DropRef(cb) => lua.dereference(cb),
+    }
+}
+
+unsafe fn discard_callbacks(lua: State, callbacks: RequestCallbacks) {
+    if let Some(cb) = callbacks.success {
+        lua.dereference(cb);
+    }
+    if let Some(cb) = callbacks.failed {
+        lua.dereference(cb);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpStats, RequestRegistry};
+    use super::{BodyBudget, HttpStats, RequestRegistry};
     use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn request_lifecycle_updates_stats() {
@@ -394,10 +486,36 @@ mod tests {
     #[test]
     fn cancelled_request_is_removed_after_completion() {
         let registry = Arc::new(RequestRegistry::new());
-        let request = registry.register();
+        let request = registry.register(None, None);
         assert!(registry.cancel(request.id));
         assert!(request.token.is_cancelled());
         drop(request);
         assert!(!registry.cancel(1));
+    }
+
+    #[test]
+    fn shutdown_collects_callback_references() {
+        let registry = Arc::new(RequestRegistry::new());
+        let request = registry.register(Some(10), Some(11));
+
+        let callbacks = registry.cancel_all();
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].success, Some(10));
+        assert_eq!(callbacks[0].failed, Some(11));
+        assert!(request.token.is_cancelled());
+    }
+
+    #[test]
+    fn body_budget_keeps_bytes_reserved_until_callback_is_dropped() {
+        let budget = Arc::new(Semaphore::new(8));
+        let permit = budget
+            .clone()
+            .try_acquire_many_owned(8)
+            .expect("budget should accept the body");
+        let mut body_budget = BodyBudget::new();
+        body_budget.reserve(permit);
+        assert_eq!(budget.available_permits(), 0);
+        drop(body_budget);
+        assert_eq!(budget.available_permits(), 8);
     }
 }

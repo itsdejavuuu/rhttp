@@ -9,7 +9,7 @@ Use it for APIs, webhooks, auth services, telemetry, or whatever external servic
 - HTTPS, connection pooling, redirects (max 10), gzip/brotli/deflate.
 - Any valid HTTP method.
 - Query params, form posts, JSON/binary bodies, request/response headers.
-- 20 MB request and response limit.
+- 20 MB per request/response body; 64 MB total buffered-body budget.
 - 256 concurrent network requests; 1024 requests in flight total.
 - Retry/backoff, cancellation, and lightweight counters.
 - Linux x86-64 and Windows x86-64.
@@ -146,6 +146,7 @@ Do not enable POST retries without an idempotency key or equivalent server-side 
 - Redirects: 10.
 - Network concurrency: 256.
 - In-flight limit: 1024.
+- Total Rust-side body buffering: 64 MB. A request fails with `rhttp buffered body limit reached` when this budget is exhausted.
 
 ## Build and install
 
